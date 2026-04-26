@@ -1,30 +1,22 @@
-"""vault.py — Core vault operations for envault.
+"""Core vault operations: lock/unlock .env files, with optional profile support."""
 
-Provides high-level functions to lock (encrypt) and unlock (decrypt)
-.env files, as well as read/write the encrypted vault format to disk.
-"""
+from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
+from typing import Dict, Optional, Tuple
 
-from envault.crypto import derive_key, encrypt, decrypt
-
-# Default filenames used by the CLI and sync tooling
-DEFAULT_ENV_FILE = ".env"
-DEFAULT_VAULT_FILE = ".env.vault"
+from envault.crypto import encrypt, decrypt
+from envault import profiles as prof
 
 
-def _parse_env(text: str) -> dict[str, str]:
-    """Parse a .env file into a plain dict.
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
-    Supports:
-    - KEY=VALUE pairs
-    - Lines beginning with '#' are treated as comments and ignored
-    - Quoted values (single or double quotes are stripped)
-    - Empty lines are skipped
-    """
-    env: dict[str, str] = {}
+def _parse_env(text: str) -> Dict[str, str]:
+    """Parse KEY=VALUE lines; skip blanks and comments."""
+    result: Dict[str, str] = {}
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
@@ -32,98 +24,78 @@ def _parse_env(text: str) -> dict[str, str]:
         if "=" not in line:
             continue
         key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip()
-        # Strip surrounding quotes if present
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
-            value = value[1:-1]
-        env[key] = value
-    return env
+        result[key.strip()] = value.strip()
+    return result
 
 
-def _serialize_env(env: dict[str, str]) -> str:
-    """Serialize a dict back into .env file format."""
-    lines = [f'{key}="{value}"' for key, value in env.items()]
-    return "\n".join(lines) + "\n"
+def _serialize_env(env: Dict[str, str]) -> str:
+    """Serialize a dict back to KEY=VALUE text."""
+    return "\n".join(f"{k}={v}" for k, v in env.items()) + "\n"
 
 
-def lock(master_password: str, env_path: str | Path = DEFAULT_ENV_FILE) -> bytes:
-    """Read a .env file and return an encrypted vault blob.
+# ---------------------------------------------------------------------------
+# Vault I/O
+# ---------------------------------------------------------------------------
 
-    The vault blob is a JSON envelope containing:
-    - ``cipherblob``: hex-encoded encrypted payload
-    - ``version``:    format version for future migrations
+def save_vault(vault_path: Path, cipherblob: bytes) -> None:
+    vault_path.write_bytes(cipherblob)
 
-    Args:
-        master_password: The password used to derive the encryption key.
-        env_path:        Path to the plaintext .env file to encrypt.
 
-    Returns:
-        UTF-8 encoded JSON bytes representing the sealed vault.
+def load_vault(vault_path: Path) -> bytes:
+    if not vault_path.exists():
+        raise FileNotFoundError(f"Vault not found: {vault_path}")
+    return vault_path.read_bytes()
 
-    Raises:
-        FileNotFoundError: If *env_path* does not exist.
-    """
-    env_path = Path(env_path)
-    if not env_path.exists():
-        raise FileNotFoundError(f"No .env file found at '{env_path}'")
 
-    plaintext = env_path.read_text(encoding="utf-8")
-    key = derive_key(master_password)
-    cipherblob = encrypt(key, plaintext.encode("utf-8"))
+# ---------------------------------------------------------------------------
+# High-level operations
+# ---------------------------------------------------------------------------
 
-    envelope = {
-        "version": 1,
-        "cipherblob": cipherblob.hex(),
-    }
-    return json.dumps(envelope, indent=2).encode("utf-8")
+def lock(
+    env_path: Path,
+    password: str,
+    vault_path: Optional[Path] = None,
+    profile: str = prof.DEFAULT_PROFILE,
+    base_dir: Optional[Path] = None,
+) -> Path:
+    """Encrypt *env_path* and write a vault file. Returns the vault path."""
+    plaintext = env_path.read_bytes()
+    cipherblob = encrypt(password, plaintext)
+
+    _base = base_dir or env_path.parent
+    if vault_path is None:
+        vault_path = _base / prof.vault_filename_for(profile)
+
+    save_vault(vault_path, cipherblob)
+    prof.register_profile(_base, profile, vault_path.name)
+    return vault_path
 
 
 def unlock(
-    master_password: str,
-    vault_data: bytes,
-) -> dict[str, str]:
-    """Decrypt a vault blob and return the parsed environment variables.
+    vault_path: Path,
+    password: str,
+    env_path: Optional[Path] = None,
+    profile: str = prof.DEFAULT_PROFILE,
+    base_dir: Optional[Path] = None,
+) -> Path:
+    """Decrypt *vault_path* and write the .env file. Returns the env path."""
+    cipherblob = load_vault(vault_path)
+    plaintext = decrypt(password, cipherblob)  # raises ValueError on bad key
 
-    Args:
-        master_password: The password used to derive the decryption key.
-        vault_data:      Raw bytes of the vault file (JSON envelope).
+    _base = base_dir or vault_path.parent
+    if env_path is None:
+        suffix = "" if profile == prof.DEFAULT_PROFILE else f".{profile}"
+        env_path = _base / f".env{suffix}"
 
-    Returns:
-        A dict mapping environment variable names to their values.
-
-    Raises:
-        ValueError:  If the master password is wrong or the blob is corrupted.
-        KeyError:    If the vault envelope is missing expected fields.
-    """
-    envelope = json.loads(vault_data.decode("utf-8"))
-    cipherblob = bytes.fromhex(envelope["cipherblob"])
-    key = derive_key(master_password)
-    plaintext_bytes = decrypt(key, cipherblob)  # raises ValueError on bad key
-    return _parse_env(plaintext_bytes.decode("utf-8"))
+    env_path.write_bytes(plaintext)
+    return env_path
 
 
-def save_vault(vault_data: bytes, vault_path: str | Path = DEFAULT_VAULT_FILE) -> None:
-    """Write encrypted vault bytes to *vault_path*.
-
-    The file is written with mode 0o600 so that only the owning user can
-    read it — similar to how SSH private keys are stored.
-    """
-    vault_path = Path(vault_path)
-    vault_path.write_bytes(vault_data)
-    os.chmod(vault_path, 0o600)
-
-
-def load_vault(vault_path: str | Path = DEFAULT_VAULT_FILE) -> bytes:
-    """Read raw vault bytes from *vault_path*.
-
-    Raises:
-        FileNotFoundError: If no vault file exists at *vault_path*.
-    """
-    vault_path = Path(vault_path)
-    if not vault_path.exists():
-        raise FileNotFoundError(
-            f"No vault file found at '{vault_path}'. "
-            "Run 'envault lock' to create one."
-        )
-    return vault_path.read_bytes()
+def view(
+    vault_path: Path,
+    password: str,
+) -> Dict[str, str]:
+    """Decrypt and return the env vars without writing to disk."""
+    cipherblob = load_vault(vault_path)
+    plaintext = decrypt(password, cipherblob)
+    return _parse_env(plaintext.decode())

@@ -1,84 +1,96 @@
-"""Command-line interface for envault."""
+"""CLI entry-point for envault, with multi-profile support."""
+
+from __future__ import annotations
 
 import sys
-import click
 from pathlib import Path
 
-from envault.vault import lock, unlock, load_vault, save_vault
+import click
+
+from envault import vault, profiles as prof
 
 
 @click.group()
-@click.version_option(prog_name="envault")
-def cli():
-    """envault — local secrets manager for encrypted .env files."""
-    pass
+def cli() -> None:
+    """envault — local secrets manager."""
 
+
+# ---------------------------------------------------------------------------
+# lock
+# ---------------------------------------------------------------------------
 
 @cli.command("lock")
 @click.argument("env_file", default=".env", type=click.Path(exists=True))
-@click.option(
-    "--output", "-o",
-    default=".env.vault",
-    help="Output path for the encrypted vault file.",
-    show_default=True,
-)
-@click.option("--key", envvar="ENVAULT_MASTER_KEY", prompt=True, hide_input=True,
-              help="Master key (or set ENVAULT_MASTER_KEY env var).")
-def lock_cmd(env_file, output, key):
-    """Encrypt ENV_FILE and write to an encrypted vault."""
+@click.option("--password", "-p", prompt=True, hide_input=True, help="Master password")
+@click.option("--profile", default=prof.DEFAULT_PROFILE, show_default=True, help="Named profile")
+def lock_cmd(env_file: str, password: str, profile: str) -> None:
+    """Encrypt ENV_FILE into a vault."""
     env_path = Path(env_file)
-    out_path = Path(output)
+    vault_path = vault.lock(env_path, password, profile=profile)
+    click.echo(f"Locked → {vault_path}  (profile: {profile})")
 
-    raw = env_path.read_text(encoding="utf-8")
-    vault_data = lock(raw, key)
-    save_vault(vault_data, out_path)
 
-    click.echo(f"Locked '{env_path}' → '{out_path}'")
-
+# ---------------------------------------------------------------------------
+# unlock
+# ---------------------------------------------------------------------------
 
 @cli.command("unlock")
-@click.argument("vault_file", default=".env.vault", type=click.Path(exists=True))
-@click.option(
-    "--output", "-o",
-    default=".env",
-    help="Output path for the decrypted .env file.",
-    show_default=True,
-)
-@click.option("--key", envvar="ENVAULT_MASTER_KEY", prompt=True, hide_input=True,
-              help="Master key (or set ENVAULT_MASTER_KEY env var).")
-def unlock_cmd(vault_file, output, key):
-    """Decrypt a vault file and write the plaintext .env."""
-    vault_path = Path(vault_file)
-    out_path = Path(output)
-
-    try:
-        vault_data = load_vault(vault_path)
-        plaintext = unlock(vault_data, key)
-    except ValueError as exc:
-        click.echo(f"Error: {exc}", err=True)
+@click.option("--password", "-p", prompt=True, hide_input=True, help="Master password")
+@click.option("--profile", default=prof.DEFAULT_PROFILE, show_default=True, help="Named profile")
+@click.option("--out", "env_out", default=None, help="Output .env path")
+def unlock_cmd(password: str, profile: str, env_out: str | None) -> None:
+    """Decrypt a vault back to a .env file."""
+    base_dir = Path(".")
+    vault_path = prof.resolve_vault_path(base_dir, profile)
+    if vault_path is None:
+        click.echo(f"No vault registered for profile '{profile}'.", err=True)
         sys.exit(1)
 
-    out_path.write_text(plaintext, encoding="utf-8")
-    click.echo(f"Unlocked '{vault_path}' → '{out_path}'")
+    env_path = Path(env_out) if env_out else None
+    try:
+        out = vault.unlock(vault_path, password, env_path=env_path, profile=profile)
+    except ValueError:
+        click.echo("Error: wrong password or corrupted vault.", err=True)
+        sys.exit(1)
 
+    click.echo(f"Unlocked → {out}  (profile: {profile})")
+
+
+# ---------------------------------------------------------------------------
+# view
+# ---------------------------------------------------------------------------
 
 @cli.command("view")
-@click.argument("vault_file", default=".env.vault", type=click.Path(exists=True))
-@click.option("--key", envvar="ENVAULT_MASTER_KEY", prompt=True, hide_input=True,
-              help="Master key (or set ENVAULT_MASTER_KEY env var).")
-def view_cmd(vault_file, key):
-    """Print decrypted secrets to stdout without writing a file."""
-    vault_path = Path(vault_file)
-
-    try:
-        vault_data = load_vault(vault_path)
-        plaintext = unlock(vault_data, key)
-    except ValueError as exc:
-        click.echo(f"Error: {exc}", err=True)
+@click.option("--password", "-p", prompt=True, hide_input=True, help="Master password")
+@click.option("--profile", default=prof.DEFAULT_PROFILE, show_default=True, help="Named profile")
+def view_cmd(password: str, profile: str) -> None:
+    """Print decrypted secrets without writing to disk."""
+    base_dir = Path(".")
+    vault_path = prof.resolve_vault_path(base_dir, profile)
+    if vault_path is None:
+        click.echo(f"No vault registered for profile '{profile}'.", err=True)
         sys.exit(1)
 
-    click.echo(plaintext)
+    try:
+        env_vars = vault.view(vault_path, password)
+    except ValueError:
+        click.echo("Error: wrong password or corrupted vault.", err=True)
+        sys.exit(1)
+
+    for key, value in env_vars.items():
+        click.echo(f"{key}={value}")
 
 
-if __name__ == "__main__":  # pragma: no cover
-    cli()
+# ---------------------------------------------------------------------------
+# profiles
+# ---------------------------------------------------------------------------
+
+@cli.command("profiles")
+def profiles_cmd() -> None:
+    """List all registered profiles in the current directory."""
+    names = prof.list_profiles(Path("."))
+    if not names:
+        click.echo("No profiles registered.")
+        return
+    for name in names:
+        click.echo(name)
