@@ -82,15 +82,17 @@ def view_cmd(password: str, profile: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# profiles
+# list-profiles
 # ---------------------------------------------------------------------------
 
-@cli.command("profiles")
-def profiles_cmd() -> None:
-    """List all registered profiles in the current directory."""
-    names = prof.list_profiles(Path("."))
-    if not names:
+@cli.command("list-profiles")
+def list_profiles_cmd() -> None:
+    """List all profiles registered in the current directory."""
+    base_dir = Path(".")
+    registered = prof.list_profiles(base_dir)
+    if not registered:
         click.echo("No profiles registered.")
         return
-    for name in names:
-        click.echo(name)
+    for name in registered:
+        marker = " (default)" if name == prof.DEFAULT_PROFILE else ""
+        click.echo(f"  {name}{marker}")
