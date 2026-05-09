@@ -78,7 +78,22 @@ def summary_lines(result: CompareResult, left_label: str = "left", right_label: 
     for key, val in result.only_in_right.items():
         lines.append(f"  > {key}={val}  (only in {right_label})")
     for key, (lv, rv) in result.changed.items():
-        lines.append(f"  ~ {key}: {left_label}={lv!r}  {right_label}={rv!r}")
-    if not lines:
-        lines.append("  (no differences)")
+        lines.append(f"  ~ {key}: {lv!r} -> {rv!r}")
+    if not result.has_differences:
+        lines.append(f"  (no differences between {left_label} and {right_label})")
     return lines
+
+
+def stats(result: CompareResult) -> Dict[str, int]:
+    """Return a dictionary of counts for each category in the comparison result.
+
+    Useful for quick programmatic inspection or displaying a summary header.
+    """
+    return {
+        "only_in_left": len(result.only_in_left),
+        "only_in_right": len(result.only_in_right),
+        "changed": len(result.changed),
+        "identical": len(result.identical),
+        "total": len(result.only_in_left) + len(result.only_in_right)
+                 + len(result.changed) + len(result.identical),
+    }
